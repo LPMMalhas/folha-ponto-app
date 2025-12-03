@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Controle de Ponto e Horas</title>
+    
+    <!-- Carregamento de Bibliotecas via CDN -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+    <style>
+        @media print {
+            @page { size: A4; margin: 5mm; }
+            body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            .no-print { display: none !important; }
+        }
+        body { visibility: visible; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+    <div id="root"></div>
+
+    <!-- Script Principal com React -->
+    <script type="text/babel" data-type="module">
+        const { useState, useEffect, useMemo, useRef } = React;
+        const Icon = ({ name, className }) => <i data-lucide={name} className={className}></i>;
+
+        // --- CONFIGURAÇÕES PADRÃO ---
+        const DEFAULT_CONFIG = {
+            dailyTargetMonThu: "08:48", dailyTargetFri: "08:00", useTimeBank: true,
+            defaultStart: "07:00", defaultLunchStart: "12:00", defaultLunchEnd: "13:00",
+            defaultEndMonThu: "17:30", defaultEndFri: "16:00",
+            companyName: "Minha Empresa", employeeName: "Colaborador"
+        };
+
+        // --- FUNÇÕES UTILITÁRIAS ---
+        const timeToMinutes = (str) => { if(!str) return 0; const [h,m] = str.split(':').map(Number); return (h*60)+m; };
+        const minutesToTime = (total) => { 
+            if(total===undefined || isNaN(total)) return "00:00"; 
+            const abs = Math.abs(total), h = Math.floor(abs/60), m = abs%60; 
+            return (total<0?"-":"") + String(h).padStart(2,'0') + ":" + String(m).padStart(2,'0'); 
+        };
+        const formatCurrency = (val) => new Intl.NumberFormat('pt-BR', {style:'currency', currency:'BRL'}).format(val||0);
+        const getDayName = (dateStr) => ['Domingo','Segunda','Terça','Quarta','Quinta','Sexta','Sábado'][new Date(dateStr+'T00:00:00').getDay()];
+        const isWeekend = (dateStr) => { const d = new Date(dateStr+'T00:00:00').getDay(); return d===0 || d===6; };
+
+        function App() {
+            const [currentDate, setCurrentDate] = useState(new Date());
+            
+            // ESTADOS INICIAIS (Carregando do LocalStorage se existir)
+            const [records, setRecords] = useState(() => {
+                const saved = localStorage.getItem('work_hours_records');
+                return saved ? JSON.parse(saved) : {};
+            });
+            const [config, setConfig] = useState(() => {
+                const saved = localStorage.getItem('work_hours_config');
+                return saved ? JSON.parse(saved) : DEFAULT_CONFIG;
+            });
+            const [financials, setFinancials] = useState(() => {
+                const saved = localStorage.getItem('work_hours_financials');
+                return saved ? JSON.parse(saved) : {};
+            });
+
+            // Estados de UI
+            const [showConfig, setShowConfig] = useState(false);
+            const [showFinancial, setShowFinancial] = useState(false);
+            const [showBackup, setShowBackup] = useState(false);
+            const [isExporting, setIsExporting] = useState(false);
+            
+            const reportRef = useRef(null);
+            const fileInputRef = useRef(null);
+            const currentMonthKey = `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}`;
+
+            // Efeito para carregar ícones
+            useEffect(() => { lucide.createIcons(); }, [showConfig, showFinancial, showBackup, isExporting, currentDate, records]);
+
+            // --- PERSISTÊNCIA LOCALSTORAGE ---
+            useEffect(() => { localStorage.setItem('work_hours_records', JSON.stringify(records)); }, [records]);
+            useEffect(() => { localStorage.setItem('work_hours_config', JSON.stringify(config)); }, [config]);
+            useEffect(() => { localStorage.setItem('work_hours_financials', JSON.stringify(financials)); }, [financials]);
+
+            // --- LÓGICA DE NEGÓCIO ---
+            const getDaysInMonth = () => {
+                const y = currentDate.getFullYear(), m = currentDate.getMonth();
+                const days = new Date(y, m+1, 0).getDate();
+                return Array.from({length:days}, (_,i) => `${y}-${String(m+1).padStart(2,'0')}-${String(i+1).padStart(2,'0')}`);
+            };
+
+            const getStats = (date) => {
+                const rec = records[date] || {};
+                const dow = new Date(date+'T00:00:00').getDay();
+                const isFri = dow === 5;
+                
+                const vals = isWeekend(date) ? {
+                    e1: rec.entry1||"", s1: rec.exit1||"", e2: rec.entry2||"", s2: rec.exit2||"", exE: rec.extraEntry||"", exS: rec.extraExit||""
+                } : {
+                    e1: rec.entry1!==undefined?rec.entry1:config.defaultStart,
+                    s1: rec.exit1!==undefined?rec.exit1:config.defaultLunchStart,
+                    e2: rec.entry2!==undefined?rec.entry2:config.defaultLunchEnd,
+                    s2: rec.exit2!==undefined?rec.exit2:(isFri?config.defaultEndFri:config.defaultEndMonThu),
+                    exE: rec.extraEntry||"", exS: rec.extraExit||""
+                };
+
+                let worked = 0;
+                if(vals.e1 && vals.s1) worked += timeToMinutes(vals.s1) - timeToMinutes(vals.e1);
+                if(vals.e2 && vals.s2) worked += timeToMinutes(vals.s2) - timeToMinutes(vals.e2);
+                
+                let manualEx = 0;
+                if(vals.exE && vals.exS) manualEx = timeToMinutes(vals.exS) - timeToMinutes(vals.exE);
+
+                let target = (dow===0||dow===6)?0:(isFri?timeToMinutes(config.dailyTargetFri):timeToMinutes(config.dailyTargetMonThu));
+                return { worked, target, balance: worked - target, manualEx, vals };
+            };
+
+            const getMonthData = () => {
+                let worked=0, bal=0, manEx=0, dSurplus=0, dDeficit=0;
+                getDaysInMonth().forEach(d => {
+                    const st = getStats(d);
+                    const hasData = st.vals.e1 || st.vals.e2 || st.vals.exE;
+                    manEx += st.manualEx;
+                    if(!isWeekend(d) || hasData) {
+                        worked += st.worked;
+                        bal += st.balance;
+                        if(st.balance > 0) dSurplus += st.balance;
+                        if(st.balance < 0) dDeficit += st.balance;
+                    }
+                });
+                let dispEx = manEx;
+                if(!config.useTimeBank) dispEx += dSurplus;
+                return { worked, bal, manEx, dDeficit, dispEx, dSurplus };
+            };
+
+            const getYearBalance = () => {
+                let total = 0;
+                for(let m=0; m<=currentDate.getMonth(); m++) {
+                    const days = new Date(currentDate.getFullYear(), m+1, 0).getDate();
+                    let mBal = 0;
+                    for(let i=1; i<=days; i++) {
+                        const d = `${currentDate.getFullYear()}-${String(m+1).padStart(2,'0')}-${String(i).padStart(2,'0')}`;
+                        const st = getStats(d);
+                        if(!isWeekend(d) || st.worked>0) mBal += st.balance;
+                    }
+                    if(config.useTimeBank && mBal > 0) total += mBal;
+                }
+                return total;
+            };
+
+            const getPriorBalance = () => {
+                if(!config.useTimeBank) return 0;
+                let total = 0;
+                for(let m=0; m<currentDate.getMonth(); m++) {
+                    const days = new Date(currentDate.getFullYear(), m+1, 0).getDate();
+                    let mBal = 0;
+                    for(let i=1; i<=days; i++) {
+                        const d = `${currentDate.getFullYear()}-${String(m+1).padStart(2,'0')}-${String(i).padStart(2,'0')}`;
+                        const st = getStats(d);
+                        if(!isWeekend(d) || st.worked>0) mBal += st.balance;
+                    }
+                    if(mBal > 0) total += mBal;
+                }
+                return total;
+            };
+
+            // Finanças
+            const getFin = () => ({ baseSalary:0, normalHourValue:0, overtimeHourValue:0, bonus:0, freqPremium:0, transportAid:0, loans:0, food:0, merch:0, others:0, ...(financials[currentMonthKey]||{}) });
+
+            const calcFin = () => {
+                const fin = getFin();
+                const mStats = getMonthData();
+                const priorBal = getPriorBalance();
+                
+                const adds = fin.bonus + fin.freqPremium + fin.transportAid;
+                let exVal = 0, bankDed = 0, absorbed = 0;
+
+                if(config.useTimeBank) {
+                    exVal = (mStats.manEx/60) * fin.overtimeHourValue;
+                    if(mStats.bal < 0) {
+                        const def = Math.abs(mStats.bal);
+                        if(priorBal >= def) absorbed = def;
+                        else {
+                            absorbed = priorBal;
+                            bankDed = ((def - priorBal)/60) * fin.normalHourValue;
+                        }
+                    }
+                } else {
+                    exVal = (mStats.dispEx/60) * fin.overtimeHourValue;
+                    bankDed = (Math.abs(mStats.dDeficit)/60) * fin.normalHourValue;
+                }
+
+                const disc = fin.loans + fin.food + fin.merch + fin.others + bankDed;
+                const est = fin.baseSalary + exVal + adds - disc;
+                const valWorked = (mStats.worked/60) * fin.normalHourValue;
+                const valBank = config.useTimeBank ? (mStats.bal/60)*fin.overtimeHourValue : (mStats.dSurplus/60)*fin.overtimeHourValue;
+
+                return { fin, adds, disc, exVal, est, bankDed, absorbed, valWorked, valBank };
+            };
+
+            const handlePdf = () => {
+                setIsExporting(true);
+                setTimeout(() => {
+                    html2pdf().set({ margin:[5,5,5,5], filename:`ponto_${currentMonthKey}.pdf`, html2canvas:{scale:2}, jsPDF:{unit:'mm', format:'a4'} }).from(reportRef.current).save().then(() => setIsExporting(false));
+                }, 100);
+            };
+
+            const handleInput = (date, field, val) => {
+                setRecords(prev => ({...prev, [date]: {...prev[date], [field]: val}}));
+            };
+
+            const handleFinancialChange = (field, val) => {
+                const num = val === "" ? 0 : parseFloat(val);
+                setFinancials(prev => ({...prev, [currentMonthKey]: {...(prev[currentMonthKey]||{}), [field]: num}}));
+            };
+
+            // Actions de Backup
+            const handleBackup = () => {
+                const data = { records, config, financials, exportDate: new Date().toISOString() };
+                const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a'); a.href = url; a.download = 'backup_ponto.json'; a.click();
+            };
+            const handleRestore = () => fileInputRef.current.click();
+            const onFileChange = (e) => {
+                const f = e.target.files[0];
+                if(!f) return;
+                const r = new FileReader();
+                r.onload = ev => {
+                    try {
+                        const d = JSON.parse(ev.target.result);
+                        if(d.records) setRecords(d.records);
+                        if(d.config) setConfig(d.config);
+                        if(d.financials) setFinancials(d.financials);
+                        alert('Restaurado!'); setShowBackup(false);
+                    } catch(err){ alert('Erro arquivo'); }
+                };
+                r.readAsText(f);
+            };
+
+            // Actions Download TXT
+            const handleTxt = () => {
+                let txt = `RELATÓRIO - ${config.employeeName} - ${currentMonthKey}\n-----------------------------------\n`;
+                getDaysInMonth().forEach(d => {
+                    const st = getStats(d);
+                    if(!isWeekend(d) || st.worked>0) txt += `${d}: ENT:${st.vals.e1} SAI:${st.vals.s2} SALDO:${minutesToTime(st.balance)}\n`;
+                });
+                const blob = new Blob([txt], {type:'text/plain'});
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a'); a.href=url; a.download=`ponto_${currentMonthKey}.txt`; a.click();
+            };
+
+            // RENDER
+            const { fin, exVal, bankDed, est, absorbed, valWorked, valBank } = calcFin();
+            const mStats = getMonthData();
+            const yBal = getYearBalance();
+            const days = getDaysInMonth();
+
+            const headerCls = isExporting ? "bg-white text-black border-b-2 border-black p-4" : "bg-blue-900 text-white p-4 shadow-lg sticky top-0 z-10";
+            const cardCls = (isExp, color) => isExp ? "border border-gray-300" : `border ${color} bg-opacity-40`;
+
+            return (
+                <div className={isExporting ? "bg-white text-xs" : "min-h-screen pb-20"}>
+                    <div ref={reportRef} className={isExporting ? "p-6 max-w-[210mm] mx-auto" : ""}>
+                        <header className={headerCls}>
+                            <div className="max-w-4xl mx-auto">
+                                <div className="flex justify-between items-start mb-2">
+                                    <div>
+                                        <h1 className="font-bold text-xl flex items-center gap-2">
+                                            {!isExporting && <Icon name="clock" className="w-6 h-6"/>}
+                                            {isExporting ? config.companyName : "Controle de Ponto"}
+                                        </h1>
+                                        <p className={isExporting ? "text-black" : "text-blue-200"}>{isExporting ? `Relatório - ${config.employeeName}` : config.employeeName}</p>
+                                    </div>
+                                    {!isExporting && (
+                                        <div className="flex gap-2">
+                                            <button onClick={()=>setShowBackup(true)} className="p-2 bg-blue-800 rounded-full"><Icon name="database" className="w-5 h-5"/></button>
+                                            <button onClick={()=>setShowFinancial(true)} className="p-2 bg-emerald-600 rounded-full"><Icon name="wallet" className="w-5 h-5"/></button>
+                                            <button onClick={handlePdf} className="p-2 bg-blue-800 rounded-full"><Icon name="file-down" className="w-5 h-5"/></button>
+                                            <button onClick={()=>setShowConfig(true)} className="p-2 hover:bg-blue-800 rounded-full"><Icon name="settings" className="w-5 h-5"/></button>
+                                        </div>
+                                    )}
+                                    {isExporting && (
+                                        <div className="text-right">
+                                            <p className="font-bold uppercase">{currentDate.toLocaleDateString('pt-BR',{month:'long',year:'numeric'})}</p>
+                                            <p>Regime: {config.useTimeBank ? "Banco" : "Mensal"}</p>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {!isExporting && (
+                                    <div className="flex justify-between items-center bg-blue-800 rounded-lg p-2 mb-4">
+                                        <button onClick={()=>{const d=new Date(currentDate);d.setMonth(d.getMonth()-1);setCurrentDate(d)}} className="p-1"><Icon name="chevron-left" className="w-6 h-6"/></button>
+                                        <span className="font-bold capitalize">{currentDate.toLocaleDateString('pt-BR',{month:'long',year:'numeric'})}</span>
+                                        <button onClick={()=>{const d=new Date(currentDate);d.setMonth(d.getMonth()+1);setCurrentDate(d)}} className="p-1"><Icon name="chevron-right" className="w-6 h-6"/></button>
+                                    </div>
+                                )}
+
+                                {/* RESUMOS */}
+                                {isExporting ? (
+                                    <div className="grid grid-cols-2 gap-4 mb-4 border border-black p-2">
+                                        <div>
+                                            <h3 className="font-bold border-b border-black">RESUMO HORAS</h3>
+                                            <div className="grid grid-cols-2">
+                                                <p>Trab: <b>{minutesToTime(mStats.worked)}</b></p>
+                                                <p>Extras: <b>{minutesToTime(mStats.dispEx)}</b></p>
+                                                {config.useTimeBank ? (
+                                                    <><p>Banco Mês: {minutesToTime(mStats.bal)}</p><p>Banco Ano: {minutesToTime(yBal)}</p></>
+                                                ) : <p>Faltas: {minutesToTime(mStats.dDeficit)}</p>}
+                                            </div>
+                                        </div>
+                                        <div>
+                                            <h3 className="font-bold border-b border-black">FINANCEIRO</h3>
+                                            <div className="grid grid-cols-2">
+                                                <p>Base: {formatCurrency(fin.baseSalary)}</p>
+                                                <p>Extras: {formatCurrency(exVal)}</p>
+                                                <p>Desc. Faltas: {formatCurrency(bankDed)}</p>
+                                                <p><b>Líquido: {formatCurrency(est)}</b></p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <div className="grid grid-cols-2 gap-2 mb-2 text-white">
+                                        <div className={`p-3 rounded-lg ${cardCls(false, 'bg-emerald-900 border-emerald-600')}`}>
+                                            <p className="text-xs uppercase opacity-70">Extras</p>
+                                            <p className="text-xl font-bold">{minutesToTime(mStats.dispEx)}</p>
+                                        </div>
+                                        <div className={`p-3 rounded-lg ${cardCls(false, 'bg-blue-900 border-blue-600')}`}>
+                                            <p className="text-xs uppercase opacity-70">{config.useTimeBank ? "Banco Mês" : "Saldo Mês"}</p>
+                                            <p className="text-xl font-bold">{minutesToTime(mStats.bal)}</p>
+                                        </div>
+                                        <div className="col-span-2 grid grid-cols-2 gap-2">
+                                            <div className="bg-white/10 p-2 rounded text-center"><p className="text-xs">Valor Trab.</p><p className="font-bold">{formatCurrency(valWorked)}</p></div>
+                                            <div className="bg-white/10 p-2 rounded text-center"><p className="text-xs">{config.useTimeBank ? "Valor Banco" : "Valor Extras"}</p><p className="font-bold">{formatCurrency(valBank)}</p></div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </header>
+
+                        {/* TABELA */}
+                        <main className="max-w-4xl mx-auto p-2">
+                            {isExporting && <div className="grid grid-cols-7 text-[9px] font-bold uppercase border-b border-black text-center"><div className="text-left">Dia</div><div>Ent</div><div>Alm</div><div>Vol</div><div>Sai</div><div>Ex.E</div><div>Ex.S</div></div>}
+                            {days.map(d => {
+                                const st = getStats(d);
+                                const isWk = isWeekend(d);
+                                const isToday = d === new Date().toISOString().split('T')[0];
+                                
+                                if(isExporting) return (
+                                    <div key={d} className={`grid grid-cols-7 text-[9px] border-b border-gray-300 py-0.5 items-center text-center ${isWk?'bg-gray-100':''}`}>
+                                        <div className="text-left pl-1">{d.split('-')[2]} <span className="text-[7px] text-gray-500">{getDayName(d).substr(0,3)}</span></div>
+                                        <div>{st.vals.e1}</div><div>{st.vals.s1}</div><div>{st.vals.e2}</div><div>{st.vals.s2}</div>
+                                        <div className="font-bold">{st.vals.exE}</div><div className="font-bold">{st.vals.exS}</div>
+                                    </div>
+                                );
+
+                                return (
+                                    <div key={d} className={`mb-2 rounded border ${isToday?'border-blue-400 ring-1 ring-blue-400':(isWk?'bg-slate-100 opacity-80':'bg-white')}`}>
+                                        <div className="flex justify-between p-2 bg-slate-50 border-b text-sm">
+                                            <div><span className="font-bold mr-2">{d.split('-')[2]}</span><span className="text-xs uppercase text-slate-500">{getDayName(d)}</span></div>
+                                            {!isWk && <div className={st.balance>=0?'text-green-600 font-bold':'text-red-600 font-bold'}>{st.balance>=0?'+':''}{minutesToTime(st.balance)}</div>}
+                                        </div>
+                                        <div className="grid grid-cols-6 gap-1 p-2">
+                                            {['entry1','exit1','entry2','exit2'].map((f,i)=><input key={f} type="time" disabled={isWk} className="w-full text-center border rounded text-sm" value={st.vals[Object.keys(st.vals)[i]]} onChange={e=>handleInput(d, f, e.target.value)} />)}
+                                            <input type="time" className="w-full text-center border border-emerald-200 bg-emerald-50 rounded text-sm font-bold text-emerald-700" value={st.vals.exE} onChange={e=>handleInput(d, 'extraEntry', e.target.value)} />
+                                            <input type="time" className="w-full text-center border border-emerald-200 bg-emerald-50 rounded text-sm font-bold text-emerald-700" value={st.vals.exS} onChange={e=>handleInput(d, 'extraExit', e.target.value)} />
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                            {isExporting && <div className="mt-8 pt-4 border-t border-black flex justify-between text-[10px]"><div className="w-1/3 text-center border-t border-black pt-1">Assinatura Colaborador</div><div className="w-1/3 text-center border-t border-black pt-1">Assinatura Responsável</div></div>}
+                        </main>
+                    </div>
+
+                    {/* MODAIS (Config, Finan, Backup) */}
+                    {!isExporting && (
+                        <>
+                            {showConfig && (
+                                <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+                                    <div className="bg-white rounded p-4 w-full max-w-sm max-h-[90vh] overflow-auto">
+                                        <h2 className="font-bold mb-4 flex justify-between">Configurações <button onClick={()=>setShowConfig(false)}><Icon name="x" className="w-5"/></button></h2>
+                                        <div className="space-y-3">
+                                            <input className="border w-full p-2" placeholder="Empresa" value={config.companyName} onChange={e=>setConfig({...config, companyName:e.target.value})} />
+                                            <input className="border w-full p-2" placeholder="Colaborador" value={config.employeeName} onChange={e=>setConfig({...config, employeeName:e.target.value})} />
+                                            <div className="flex items-center justify-between border p-2 rounded cursor-pointer" onClick={()=>setConfig({...config, useTimeBank:!config.useTimeBank})}>
+                                                <span className="text-sm">Banco de Horas?</span>
+                                                <Icon name={config.useTimeBank?"toggle-right":"toggle-left"} className={config.useTimeBank?"text-blue-600":"text-gray-400"} />
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-2"><input type="time" className="border p-1" value={config.defaultStart} onChange={e=>setConfig({...config, defaultStart:e.target.value})} /><input type="time" className="border p-1" value={config.defaultLunchStart} onChange={e=>setConfig({...config, defaultLunchStart:e.target.value})} /></div>
+                                            <button onClick={()=>setShowConfig(false)} className="w-full bg-blue-600 text-white p-2 rounded mt-2">Salvar</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {showFinancial && (
+                                <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+                                    <div className="bg-white rounded p-4 w-full max-w-sm max-h-[90vh] overflow-auto">
+                                        <h2 className="font-bold mb-4 flex justify-between">Financeiro <button onClick={()=>setShowFinancial(false)}><Icon name="x" className="w-5"/></button></h2>
+                                        <div className="space-y-2 text-sm">
+                                            <div className="bg-blue-50 p-2 rounded">
+                                                <label>Salário Base</label><input type="number" className="border w-full p-1" value={fin.baseSalary} onChange={e=>handleFinancialChange('baseSalary', e.target.value)} />
+                                                <div className="grid grid-cols-2 gap-2 mt-1">
+                                                    <div><label>Valor Hora</label><input type="number" className="border w-full p-1" value={fin.normalHourValue} onChange={e=>handleFinancialChange('normalHourValue', e.target.value)} /></div>
+                                                    <div><label>Valor Extra</label><input type="number" className="border w-full p-1" value={fin.overtimeHourValue} onChange={e=>handleFinancialChange('overtimeHourValue', e.target.value)} /></div>
+                                                </div>
+                                            </div>
+                                            <p className="font-bold border-b">Adicionais</p>
+                                            <input type="number" placeholder="Bonificação" className="border w-full p-1" value={fin.bonus} onChange={e=>handleFinancialChange('bonus', e.target.value)} />
+                                            <p className="font-bold border-b mt-2">Descontos</p>
+                                            {absorbed>0 && <div className="text-blue-600 font-bold text-xs">Abatido Banco: {minutesToTime(absorbed)}</div>}
+                                            {bankDed>0 && <div className="text-red-600 font-bold text-xs">Desc. Faltas: -{formatCurrency(bankDed)}</div>}
+                                            <input type="number" placeholder="Vales" className="border w-full p-1" value={fin.loans} onChange={e=>handleFinancialChange('loans', e.target.value)} />
+                                            <div className="bg-emerald-100 p-2 rounded text-center mt-4">
+                                                <p className="text-xs font-bold text-emerald-800">A RECEBER</p>
+                                                <p className="text-xl font-bold text-emerald-900">{formatCurrency(est)}</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {showBackup && (
+                                <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+                                    <div className="bg-white rounded p-4 w-full max-w-sm">
+                                        <h2 className="font-bold mb-4 flex justify-between">Backup <button onClick={()=>setShowBackup(false)}><Icon name="x" className="w-5"/></button></h2>
+                                        <p className="text-xs mb-4">Salva os dados no seu computador para não perder.</p>
+                                        <div className="space-y-2">
+                                            <button onClick={handleBackup} className="w-full bg-blue-600 text-white p-2 rounded flex items-center justify-center gap-2"><Icon name="save" className="w-4 h-4"/> Baixar Backup</button>
+                                            <div className="relative">
+                                                <input ref={fileInputRef} type="file" onChange={onFileChange} className="hidden"/>
+                                                <button onClick={handleRestore} className="w-full bg-gray-200 text-black p-2 rounded flex items-center justify-center gap-2"><Icon name="upload" className="w-4 h-4"/> Restaurar</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </>
+                    )}
+                    
+                    {!isExporting && (
+                        <div className="fixed bottom-6 right-6 flex flex-col gap-3">
+                            <button onClick={handleTxt} className="bg-slate-600 text-white p-3 rounded-full shadow-lg" title="Baixar TXT"><Icon name="file-text" className="w-5 h-5"/></button>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
